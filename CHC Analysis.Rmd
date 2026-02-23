@@ -1,0 +1,92 @@
+---
+title: "CHC analysis"
+date: "2026-02-20"
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(themeEdge)
+library(openxlsx)
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(dplyr)
+library(stringr)
+
+edge_palette <- c("#23203F", "#56BABF", "#F28F64", "#559370", "#C18DBE", "#878787", 
+                  "#266164", "#494384", "#BDBADC", "#6C3B69", "#A3C736", "#41C7C4",
+                  "#3940CF","#A54ABE","#471D53","#AFBFD5","#C7B9CB", "#FF7F50", 
+                  "#008080","#FFD700", "#8A2BE2", "#FF6347","#20B2AA", "#8B4513", "#9370DB")
+```
+
+## Data load and cleaning Cleaning
+
+```{r setup, include=FALSE}
+
+user_home <- Sys.getenv("USERPROFILE")  
+data_path <- dirname(rstudioapi::getSourceEditorContext()$path) %>% str_replace("Scripts", "Data/Quarterly stats")
+file_name <- "CHC-and-FNC-Data-File-Q1-2017-18-to-Q3-2025-26-TQ68n.csv"
+output_path <- dirname(rstudioapi::getSourceEditorContext()$path) %>% str_replace("Data work/Scripts", "doc and ppt/Quarterly plots")
+
+quarterly_stats <- read.csv(file.path(data_path, file_name)) %>% clean_names()
+
+quarterly_stats_cleaned <- quarterly_stats %>%
+  #filter(organisation_type == "ICB") %>%
+  select(time_period, organisation_type, organisation_code, 
+         organisation_name, starts_with(c("elig_std", "elig_ft", "elig_total", 
+                                          "new_refs", "refs_compl", "total_refs_compl", 
+                                          "assmts_compl", "total_assmts", "assd_eligible",
+                                          "no_longer", "total_no", "assmt_conv", "ref_conv", 
+                                          "total_dsts", "number_refs_disc"))) %>%
+  mutate(time_period = )
+
+quarterly_stats_ICB_short <- quarterly_stats_cleaned %>%
+  filter(organisation_code %in% c("QOX", "QU9", "QJK", "QRL", "QKS", "QRV", "QHL", "QUE", "QOQ", "QE1", "QMJ", "QHM"))
+```
+
+## Visualisation
+```{r}
+# Plot function - line chart overtime
+plot_linechart <- function(data){
+  
+  data <- data %>%
+    mutate(RGN22NM = str_to_title(RGN22NM),
+           age_range = factor(gsub("_", "-", age_range), levels = c("0-4", "5-17", "18-64", "65-74", "75+"))) 
+  plot <-
+    ggplot(data, aes(x = temperature_degrees_celsius, y = Mortality, color = age_range)) +
+    scale_color_manual(values = edge_palette) +
+    geom_line(size = 1.5) +
+    scale_x_continuous(limits = c(20, 32),
+                       breaks = seq(20, 32, by = 2), 
+                       labels = scales::number_format(accuracy = 1)) +  
+    labs(
+      title = "Heat-related Mortality RR by Temperature and Region (Murage et al. 2022)",
+      x = "Daily Mean Temperature (°C)",
+      y = "Mortaity Relative Risk"
+    ) +
+    guides(color = guide_legend(title = "Age Range")) +
+    theme_edge() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 22, face = "bold"),  
+      plot.subtitle = element_text(hjust = 0.5, size = 16),
+      legend.position = "bottom",
+      legend.key.width = unit(1, "cm"),
+      legend.title = element_text(size = 20, face = "bold"),
+      legend.text = element_text(size = 20),
+      strip.text = element_text(size = 20),
+      axis.text.x = element_text(size = 20),
+      axis.title.x = element_text(size = 20),
+      axis.text.y = element_text(size = 20),
+      axis.title.y = element_text(size = 20)
+    ) + facet_wrap(~ RGN22NM,
+    labeller = labeller(RGN22NM = label_wrap_gen(width = 23))) 
+  
+  return(plot)
+}
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
