@@ -12,6 +12,7 @@ library(lubridate)
 library(janitor)
 library(dplyr)
 library(stringr)
+library(ggrepel)
 
 edge_palette <- c("#23203F", "#56BABF", "#F28F64", "#559370", "#C18DBE", "#878787", 
                   "#266164", "#494384", "#BDBADC", "#6C3B69", "#A3C736", "#41C7C4",
@@ -19,74 +20,360 @@ edge_palette <- c("#23203F", "#56BABF", "#F28F64", "#559370", "#C18DBE", "#87878
                   "#008080","#FFD700", "#8A2BE2", "#FF6347","#20B2AA", "#8B4513", "#9370DB")
 ```
 
-## Data load and cleaning Cleaning
+# ============================================================
+# 1. DATA LOAD & CLEANING
+# ============================================================
 
-```{r setup, include=FALSE}
-
+```{r load-data}
 user_home <- Sys.getenv("USERPROFILE")  
-data_path <- dirname(rstudioapi::getSourceEditorContext()$path) %>% str_replace("Scripts", "Data/Quarterly stats")
-file_name <- "CHC-and-FNC-Data-File-Q1-2017-18-to-Q3-2025-26-TQ68n.csv"
-output_path <- dirname(rstudioapi::getSourceEditorContext()$path) %>% str_replace("Data work/Scripts", "doc and ppt/Quarterly plots")
+data_path <- dirname(rstudioapi::getSourceEditorContext()$path) %>% 
+  str_replace("Scripts/CHC-analysis", "Data/Quarterly stats")
+output_path <- dirname(rstudioapi::getSourceEditorContext()$path) %>% 
+  str_replace("Data work/Scripts/CHC-analysis", "doc and ppt/Quarterly plots")
 
-quarterly_stats <- read.csv(file.path(data_path, file_name)) %>% clean_names()
+file_qs   <- "CHC-and-FNC-Data-File-Q1-2017-18-to-Q3-2025-26-TQ68n.csv"
+file_depr <- "ICB_IMD2025_OSGB1936_1171968389224791813.csv"  
+file_icb_lookup <- "Integrated_Care_Boards_(April_2023)_Names_and_Codes_in_England.csv"
 
-quarterly_stats_cleaned <- quarterly_stats %>%
-  #filter(organisation_type == "ICB") %>%
-  select(time_period, organisation_type, organisation_code, 
-         organisation_name, starts_with(c("elig_std", "elig_ft", "elig_total", 
-                                          "new_refs", "refs_compl", "total_refs_compl", 
-                                          "assmts_compl", "total_assmts", "assd_eligible",
-                                          "no_longer", "total_no", "assmt_conv", "ref_conv", 
-                                          "total_dsts", "number_refs_disc"))) %>%
-  mutate(time_period = )
+# --- Quarterly stats ---
+quarterly_stats_raw <- read.csv(file.path(data_path, file_qs)) %>% clean_names()
+
+quarterly_stats_cleaned <- quarterly_stats_raw %>%
+  mutate(
+    # Parse quarter label e.g. "Q1 2017/18" -> date of quarter start
+    quarter_num  = as.integer(str_extract(time_period, "(?<=Q)\\d")),
+    year_start   = as.integer(str_extract(time_period, "\\d{4}")),
+    quarter_date = as.Date(paste0(
+      case_when(
+        quarter_num == 1 ~ paste0(year_start, "-04-01"),
+        quarter_num == 2 ~ paste0(year_start, "-07-01"),
+        quarter_num == 3 ~ paste0(year_start, "-10-01"),
+        quarter_num == 4 ~ paste0(year_start + 1, "-01-01")
+      )
+    )),
+    fin_year = paste0(year_start, "/", str_sub(year_start + 1, 3, 4))
+  ) %>% 
+  select(time_period, quarter_date, fin_year, quarter_num,
+         organisation_type, organisation_code, organisation_name,
+         starts_with(c("elig_std", "elig_ft", "elig_total",
+                       "new_refs", "refs_compl", "total_refs_compl",
+                       "assmts_compl", "total_assmts", "assd_eligible",
+                       "no_longer", "total_no", "assmt_conv", "ref_conv",
+                       "total_dsts", "number_refs_disc",
+                       "population")))
+
+icb_lookup <- read.csv(file.path(data_path, file_icb_lookup)) %>% clean_names()
+
+#--- Deprivation ---
+deprivation <- read.csv(file.path(data_path, file_depr)) %>%
+  clean_names() %>%
+  select(icb23cd, icb23nm,
+         r_avg_rank_icb,   # Rank of Average Rank (1 = most deprived)
+         r_avg_scor_icb,   # Rank of Average Score
+         rplmd10icb,       # Rank of % LSOAs in most deprived 10%
+         r_ext_icb,        # Rank of extent
+         r_loc_con_icb)    # Rank of local concentration
 
 quarterly_stats_ICB_short <- quarterly_stats_cleaned %>%
   filter(organisation_code %in% c("QOX", "QU9", "QJK", "QRL", "QKS", "QRV", "QHL", "QUE", "QOQ", "QE1", "QMJ", "QHM"))
 ```
 
-## Visualisation
-```{r}
-# Plot function - line chart overtime
-plot_linechart <- function(data){
-  
-  data <- data %>%
-    mutate(RGN22NM = str_to_title(RGN22NM),
-           age_range = factor(gsub("_", "-", age_range), levels = c("0-4", "5-17", "18-64", "65-74", "75+"))) 
-  plot <-
-    ggplot(data, aes(x = temperature_degrees_celsius, y = Mortality, color = age_range)) +
+#  ============================================================
+# 2. DERIVE ANALYSIS DATASETS
+# ============================================================
+
+```{r derive-datasets}
+# --- ICB-level snapshot (latest full quarter available) ---
+# Use snapshot eligibility (end-of-quarter) at ICB level
+# Filter to most recent quarter for cross-sectional analysis
+latest_quarter <- quarterly_stats_cleaned %>%
+  filter(organisation_type == "ICB") %>%
+  filter(quarter_date == max(quarter_date, na.rm = TRUE)) %>%
+  pull(time_period) %>% first()
+
+icb_latest <- quarterly_stats_cleaned %>%
+  filter(organisation_type == "ICB",
+         time_period == latest_quarter) %>%
+  select(organisation_code, organisation_name, quarter_date,
+         elig_total_snp,        # snapshot eligible (total CHC)
+         elig_std_snp,
+         elig_ft_snp,
+         elig_total_snp_50k,    # per 50k — our outcome variable
+         elig_std_snp_50k,
+         elig_ft_snp_50k,
+         assmt_conv_rate_std,
+         assmt_conv_rate_ft,
+         ref_conv_rate_std,
+         ref_conv_rate_ft,
+         starts_with("population"))
+
+# --- Join deprivation ---
+# Map organisation_code to ICB23CD.
+# The quarterly stats use current ICB codes (QXX format); deprivation uses ICB23CD.
+# These should correspond directly for most ICBs — adjust if merging on name.
+icb_analysis <- icb_latest %>%
+  left_join(icb_lookup, by = c("organisation_code" = "icb23cdh")) %>%
+  left_join(deprivation, by = c("icb23cd")) %>%
+  # Invert rank so higher value = more deprived (easier to interpret)
+  mutate(
+    depr_rank_inv  = max(r_avg_rank_icb,  na.rm = TRUE) + 1 - r_avg_rank_icb,
+    depr_score_inv = max(r_avg_scor_icb,  na.rm = TRUE) + 1 - r_avg_scor_icb,
+    depr_pct10_inv = max(rplmd10icb,      na.rm = TRUE) + 1 - rplmd10icb,
+    # Deprivation quintile (1 = most deprived, 5 = least deprived)
+    depr_quintile  = ntile(r_avg_rank_icb, 5),
+    depr_quintile  = factor(depr_quintile,
+                            labels = c("1 (Most deprived)", "2", "3", "4", "5 (Least deprived)"))
+  )
+
+# --- Shortlist ICBs for deep-dive ---
+icb_short_codes <- c("QOX","QU9","QJK","QRL","QKS","QRV","QHL","QUE","QOQ","QE1","QMJ","QHM")
+```
+
+#  ============================================================
+# 3. GENERIC PLOT FUNCTIONS
+# ============================================================
+
+```{r plot-functions}
+# --- 3a. Generic line chart (time series) ---
+# data must contain: x (Date), y (numeric), group (character/factor)
+plot_line <- function(data, x, y, group,
+                      title = "", subtitle = "", xlab = "", ylab = "",
+                      legend_title = "", label_wrap = 25) {
+  ggplot(data, aes(x = .data[[x]], y = .data[[y]],
+                   color = .data[[group]], group = .data[[group]])) +
+    geom_line(linewidth = 1.2) +
+    geom_point(size = 2) +
     scale_color_manual(values = edge_palette) +
-    geom_line(size = 1.5) +
-    scale_x_continuous(limits = c(20, 32),
-                       breaks = seq(20, 32, by = 2), 
-                       labels = scales::number_format(accuracy = 1)) +  
-    labs(
-      title = "Heat-related Mortality RR by Temperature and Region (Murage et al. 2022)",
-      x = "Daily Mean Temperature (°C)",
-      y = "Mortaity Relative Risk"
-    ) +
-    guides(color = guide_legend(title = "Age Range")) +
+    scale_x_date(date_labels = "%b %Y", date_breaks = "6 months") +
+    # scale_y_continuous(labels = scales::comma()) +
+    labs(title = title, subtitle = subtitle, x = xlab, y = ylab,
+         color = legend_title) +
     theme_edge() +
     theme(
-      plot.title = element_text(hjust = 0.5, size = 22, face = "bold"),  
-      plot.subtitle = element_text(hjust = 0.5, size = 16),
+      axis.text.x  = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y  = element_text(size = 11),
+      axis.title   = element_text(size = 13),
+      plot.title   = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 13),
       legend.position = "bottom",
-      legend.key.width = unit(1, "cm"),
-      legend.title = element_text(size = 20, face = "bold"),
-      legend.text = element_text(size = 20),
-      strip.text = element_text(size = 20),
-      axis.text.x = element_text(size = 20),
-      axis.title.x = element_text(size = 20),
-      axis.text.y = element_text(size = 20),
-      axis.title.y = element_text(size = 20)
-    ) + facet_wrap(~ RGN22NM,
-    labeller = labeller(RGN22NM = label_wrap_gen(width = 23))) 
-  
-  return(plot)
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text  = element_text(size = 11)
+    )
+}
+
+# --- 3b. Generic scatter plot with optional labels & regression line ---
+plot_scatter <- function(data, x, y, label = NULL,
+                         title = "", subtitle = "", xlab = "", ylab = "",
+                         add_smooth = TRUE, colour_var = NULL) {
+  p <- ggplot(data, aes(x = .data[[x]], y = .data[[y]])) +
+    scale_color_manual(values = edge_palette) +
+    # scale_y_continuous(labels = scales::comma()) +
+    labs(title = title, subtitle = subtitle, x = xlab, y = ylab) +
+    theme_edge() +
+    theme(plot.title = element_text(size = 16, face = "bold"),
+          plot.subtitle = element_text(size = 13),
+          axis.title = element_text(size = 13),
+          axis.text  = element_text(size = 11))
+
+  if (!is.null(colour_var)) {
+    p <- p + geom_point(aes(color = .data[[colour_var]]), size = 3, alpha = 0.8)
+  } else {
+    p <- p + geom_point(color = edge_palette[2], size = 3, alpha = 0.8)
+  }
+
+  if (add_smooth) {
+    p <- p + geom_smooth(method = "lm", se = TRUE,
+                         color = edge_palette[1], fill = edge_palette[9], alpha = 0.2)
+  }
+
+  if (!is.null(label)) {
+    p <- p + geom_text_repel(aes(label = .data[[label]]),
+                             size = 3, max.overlaps = 15, color = edge_palette[1])
+  }
+  p
+}
+
+# --- 3c. Generic box/jitter plot by category ---
+plot_boxjitter <- function(data, x, y,
+                           title = "", subtitle = "", xlab = "", ylab = "") {
+  ggplot(data, aes(x = .data[[x]], y = .data[[y]], fill = .data[[x]])) +
+    geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+    geom_jitter(aes(color = .data[[x]]), width = 0.2, size = 2, alpha = 0.7) +
+    scale_fill_manual(values  = edge_palette) +
+    scale_color_manual(values = edge_palette) +
+    # scale_y_continuous(labels = scales::comma()) +
+    labs(title = title, subtitle = subtitle, x = xlab, y = ylab) +
+    theme_edge() +
+    theme(legend.position = "none",
+          plot.title    = element_text(size = 16, face = "bold"),
+          plot.subtitle = element_text(size = 13),
+          axis.title    = element_text(size = 13),
+          axis.text     = element_text(size = 11))
+}
+
+# --- 3d. Funnel plot helper ---
+# Produces funnel plot of ICB rates with control limits
+plot_funnel <- function(data, rate_col, n_col, label_col,
+                        title = "Funnel plot", ylab = "Rate per 50,000") {
+  d <- data %>%
+    filter(!is.na(.data[[rate_col]]), !is.na(.data[[n_col]]),
+           .data[[n_col]] > 0) %>%
+    mutate(rate = .data[[rate_col]],
+           n    = .data[[n_col]])
+
+  grand_mean <- weighted.mean(d$rate, d$n, na.rm = TRUE)
+  d <- d %>%
+    mutate(
+      se      = sqrt(grand_mean * (1 - grand_mean / 50000) / n),
+      lcl_95  = grand_mean - 1.96 * se,
+      ucl_95  = grand_mean + 1.96 * se,
+      lcl_99  = grand_mean - 3.09 * se,
+      ucl_99  = grand_mean + 3.09 * se,
+      flag    = case_when(
+        rate > ucl_99 ~ "Above 99.8% limit",
+        rate < lcl_99 ~ "Below 99.8% limit",
+        rate > ucl_95 ~ "Above 95% limit",
+        rate < lcl_95 ~ "Below 95% limit",
+        TRUE          ~ "Within limits"
+      )
+    )
+
+  ggplot(d, aes(x = n, y = rate)) +
+    geom_ribbon(aes(ymin = lcl_99, ymax = ucl_99), fill = edge_palette[9], alpha = 0.3) +
+    geom_ribbon(aes(ymin = lcl_95, ymax = ucl_95), fill = edge_palette[9], alpha = 0.5) +
+    geom_hline(yintercept = grand_mean, color = edge_palette[1], linewidth = 1) +
+    geom_point(aes(color = flag), size = 3) +
+    geom_text_repel(data = filter(d, flag != "Within limits"),
+                    aes(label = .data[[label_col]]), size = 3) +
+    scale_color_manual(values = c("Above 99.8% limit" = edge_palette[3],
+                                  "Below 99.8% limit" = edge_palette[4],
+                                  "Above 95% limit"   = edge_palette[2],
+                                  "Below 95% limit"   = edge_palette[5],
+                                  "Within limits"     = edge_palette[7])) +
+    # scale_x_continuous(labels = scales::comma()) +
+    # scale_y_continuous(labels = scales::comma()) +
+    labs(title = title, x = "Eligible population (n)", y = ylab, color = NULL) +
+    theme_edge() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(size = 16, face = "bold"),
+          axis.title = element_text(size = 13))
 }
 ```
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+# ============================================================
+# 4. DESCRIPTIVE VISUALISATIONS
+# ============================================================
+
+```{r fig-1-national-trend}
+# Fig 1: National trend in CHC eligibility rate over time
+national_ts <- quarterly_stats_cleaned %>%
+  filter(organisation_type == "England") %>%
+  filter(!is.na(quarter_date))
+
+plot_line(national_ts,
+          x = "quarter_date", y = "elig_total_snp_50k", group = "organisation_type",
+          title = "National CHC eligibility rate over time",
+          subtitle = "Snapshot at end of quarter, per 50,000 population",
+          xlab = "Quarter", ylab = "Eligible per 50,000")
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r fig-2-icb-variation-boxplot}
+# Fig 2: Distribution of ICB eligibility rates (latest quarter)
+plot_boxjitter(icb_analysis %>% mutate(England = "ICBs"),
+               x = "England", y = "elig_total_snp_50k",
+               title = paste0("Variation in CHC eligibility rate across ICBs (", latest_quarter, ")"),
+               subtitle = "Each point = one ICB",
+               xlab = "", ylab = "Eligible per 50,000 population")
+```
+
+```{r fig-3-eligibility-by-deprivation-quintile}
+# Fig 3: Eligibility rate by deprivation quintile (box + jitter)
+plot_boxjitter(icb_analysis,
+               x = "depr_quintile", y = "elig_total_snp_50k",
+               title = "CHC eligibility rate by ICB deprivation quintile",
+               subtitle = paste0("Snapshot: ", latest_quarter,
+                                 " | Quintile 1 = most deprived"),
+               xlab = "Deprivation quintile", ylab = "Eligible per 50,000 population")
+
+plot_boxjitter(icb_analysis,
+               x = "depr_quintile", y = "assmt_conv_rate_std",
+               title = "CHC eligibility rate by ICB deprivation quintile",
+               subtitle = paste0("Snapshot: ", latest_quarter,
+                                 " | Quintile 1 = most deprived"),
+               xlab = "Deprivation quintile", ylab = "Eligible per 50,000 population")
+```
+
+```{r fig-4-scatter-deprivation-eligibility}
+# Fig 4: Scatter — deprivation rank vs eligibility rate (labelled)
+plot_scatter(icb_analysis,
+             x = "depr_rank_inv", y = "elig_total_snp_50k",
+             label = NULL,
+             title = "Deprivation vs CHC eligibility rate by ICB",
+             subtitle = "Higher deprivation rank = more deprived | Line = OLS fit",
+             xlab = "Deprivation rank (higher = more deprived)",
+             ylab = "CHC eligible per 50,000 population",
+             add_smooth = TRUE)
+
+plot_scatter(icb_analysis,
+             x = "depr_rank_inv", y = "assmt_conv_rate_std",
+             label = NULL,
+             title = "Deprivation vs Standard CHC conversion rate by ICB",
+             subtitle = "Higher deprivation rank = more deprived | Line = OLS fit",
+             xlab = "Deprivation rank (higher = more deprived)",
+             ylab = "CHC eligible per 50,000 population",
+             add_smooth = TRUE)
+```
+
+```{r fig-5-conversion-rates-by-deprivation}
+# Fig 5: Assessment conversion rate vs deprivation
+plot_scatter(icb_analysis,
+             x = "depr_rank_inv", y = "assmt_conv_rate_std",
+             label = "organisation_name",
+             title = "Deprivation vs standard CHC assessment conversion rate",
+             subtitle = "% of assessments resulting in eligibility | Line = OLS fit",
+             xlab = "Deprivation rank (higher = more deprived)",
+             ylab = "Assessment conversion rate (%)",
+             add_smooth = TRUE)
+
+plot_scatter(icb_analysis,
+             x = "depr_rank_inv", y = "assmt_conv_rate_std",
+             label = NULL,
+             title = "Deprivation vs Standard CHC conversion rate by ICB",
+             subtitle = "Higher deprivation rank = more deprived | Line = OLS fit",
+             xlab = "Deprivation rank (higher = more deprived)",
+             ylab = "CHC eligible per 50,000 population",
+             add_smooth = TRUE)
+```
+
+```{r fig-6-funnel-eligibility}
+# Fig 6: Funnel plot — ICB eligibility rates
+# Use elig_total_snp (n) and elig_total_snp_50k (rate) together
+plot_funnel(icb_analysis,
+            rate_col  = "elig_total_snp_50k",
+            n_col     = "elig_total_snp",
+            label_col = "organisation_name",
+            title     = paste0("Funnel plot: CHC eligibility rate by ICB (", latest_quarter, ")"),
+            ylab      = "Eligible per 50,000 population")
+```
+
+```{r fig-7-trend-by-deprivation-quintile}
+# Fig 7: Eligibility trend over time, faceted by deprivation quintile
+icb_analysis_quintile <- icb_analysis %>%
+  filter(!is.na(depr_quintile), !is.na(elig_total_snp_50k)) %>%
+  group_by(quarter_date, depr_quintile) %>%
+  summarise(mean_elig = mean(elig_total_snp_50k, na.rm = TRUE), .groups = "drop")
+
+ggplot(icb_analysis_quintile, aes(x = quarter_date, y = mean_elig, color = depr_quintile)) +
+  geom_point() + 
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = edge_palette) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 year") +
+  # scale_y_continuous(labels = scales::comma()) +
+  labs(title = "Mean CHC eligibility rate over time by deprivation quintile",
+       subtitle = "ICB-level mean per 50,000 | Quintile 1 = most deprived",
+       x = "Quarter", y = "Mean eligible per 50,000",
+       color = "Deprivation quintile") +
+  theme_edge() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        legend.position = "bottom")
+```
